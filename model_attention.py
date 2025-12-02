@@ -2,98 +2,92 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# ---------------------------------------------------
-# Multi-head attention block
-# ---------------------------------------------------
-class TransformerEncoderLayer(nn.Module):
-    def __init__(self, embed_dim, num_heads, ff_hidden):
+
+class Encoder(nn.Module):
+    def __init__(self, input_dim=2, hidden_dim=128):
         super().__init__()
-        self.mha = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
-
-        self.ff = nn.Sequential(
-            nn.Linear(embed_dim, ff_hidden),
-            nn.ReLU(),
-            nn.Linear(ff_hidden, embed_dim)
-        )
-
-        self.norm1 = nn.LayerNorm(embed_dim)
-        self.norm2 = nn.LayerNorm(embed_dim)
+        self.lstm = nn.LSTM(input_dim, hidden_dim, batch_first=True)
 
     def forward(self, x):
-        # Multi-head attention
-        attn_out, _ = self.mha(x, x, x)
-        x = self.norm1(x + attn_out)
-
-        # Feed Forward
-        ff_out = self.ff(x)
-        x = self.norm2(x + ff_out)
-
-        return x
+        output, hidden = self.lstm(x)
+        return output, hidden
 
 
-# ---------------------------------------------------
-# Pointer Decoder (attention scoring)
-# ---------------------------------------------------
-class PointerDecoder(nn.Module):
-    def __init__(self, embed_dim):
+class Attention(nn.Module):
+    def __init__(self, hidden_dim=128):
         super().__init__()
+        self.W1 = nn.Linear(hidden_dim, hidden_dim)
+        self.W2 = nn.Linear(hidden_dim, hidden_dim)
+        self.v = nn.Linear(hidden_dim, 1)
 
-        self.W1 = nn.Linear(embed_dim, embed_dim)
-        self.W2 = nn.Linear(embed_dim, embed_dim)
-        self.v = nn.Linear(embed_dim, 1)
+    def forward(self, enc_outputs, dec_hidden, mask):
+        """ enc_outputs: (B,N,H), dec_hidden: (B,H), mask: (B,N) """
 
-    def forward(self, context, enc_outputs):
-        """
-        context: (B, E)
-        enc_outputs: (B, N, E)
-        """
+        B, N, H = enc_outputs.shape
 
-        # Expand context to match encoder outputs
-        context = self.W1(context).unsqueeze(1)     # (B,1,E)
-        enc_proj = self.W2(enc_outputs)             # (B,N,E)
+        hidden_expanded = dec_hidden.unsqueeze(1).repeat(1, N, 1)
 
-        scores = self.v(torch.tanh(context + enc_proj)).squeeze(-1)
-        return scores  # (B, N)
+        energy = torch.tanh(self.W1(enc_outputs) + self.W2(hidden_expanded))
+
+        scores = self.v(energy).squeeze(-1)
+
+        scores = scores - mask * 1e9
+
+        probs = F.softmax(scores, dim=-1)
+
+        return scores, probs
 
 
-# ---------------------------------------------------
-# Full Transformer Pointer Network
-# ---------------------------------------------------
-class TransformerPointer(nn.Module):
-    def __init__(self, embed_dim=128, num_heads=4, ff_hidden=256, num_layers=3):
+class Decoder(nn.Module):
+    def __init__(self, hidden_dim=128):
         super().__init__()
+        self.lstm = nn.LSTM(hidden_dim, hidden_dim, batch_first=True)
+        self.attention = Attention(hidden_dim)
 
-        # Input projection (2D → embed_dim)
-        self.input_proj = nn.Linear(2, embed_dim)
+    def forward(self, enc_outputs, hidden, mask):
+        B, N, H = enc_outputs.shape
 
-        # Transformer encoder stack
-        self.layers = nn.ModuleList([
-            TransformerEncoderLayer(embed_dim, num_heads, ff_hidden)
-            for _ in range(num_layers)
-        ])
+        dec_input = torch.zeros(B, 1, H, device=enc_outputs.device)
+        dec_output, hidden = self.lstm(dec_input, hidden)
 
-        # context vector (mean pooling)
-        self.context_proj = nn.Linear(embed_dim, embed_dim)
+        dec_hidden = dec_output.squeeze(1)
 
-        # pointer network decoder
-        self.pointer = PointerDecoder(embed_dim)
+        logits, probs, hidden = self.attention(enc_outputs, dec_hidden, mask)
+        return logits, probs, hidden
 
-    def forward(self, coords):
-        """
-        coords: (B, N, 2)
-        """
 
-        x = self.input_proj(coords)   # (B,N,E)
+class PointerNet(nn.Module):
+    def __init__(self, input_dim=2, hidden_dim=128):
+        super().__init__()
+        self.encoder = Encoder(input_dim, hidden_dim)
+        self.decoder = Decoder(hidden_dim)
 
-        # Transformer encoder
-        for layer in self.layers:
-            x = layer(x)
+    def forward(self, coords, teacher=None):
+        B, N, _ = coords.shape
 
-        # Global context vector
-        context = x.mean(dim=1)            # (B,E)
-        context = self.context_proj(context)
+        enc_outputs, hidden = self.encoder(coords)
 
-        # Pointer scoring
-        scores = self.pointer(context, x)  # (B,N)
+        mask = torch.zeros(B, N, device=coords.device)
+        actions = []
+        log_probs = []
 
-        return scores
+        for step in range(N):
+            logits, probs, hidden = self.decoder(enc_outputs, hidden, mask)
+
+            if teacher is None:
+                action = torch.multinomial(probs, 1).squeeze(-1)
+            else:
+                action = teacher[:, step]
+
+            log_prob = torch.log(probs.gather(1, action.unsqueeze(-1)) + 1e-10)
+            log_probs.append(log_prob)
+
+            for b in range(B):
+                mask[b, action[b]] = 1
+
+            actions.append(action)
+
+        actions = torch.stack(actions, dim=1)
+        log_probs = torch.stack(log_probs, dim=1).squeeze(-1)
+
+        return actions, log_probs
