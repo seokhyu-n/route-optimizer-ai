@@ -1,29 +1,61 @@
 from flask import Flask, request, jsonify
-import numpy as np
 import torch
-from model_attention import load_model
+import numpy as np
+from model_attention import TransformerPointer
 
 app = Flask(__name__)
 
-model = load_model("attn_pointer_rl.pt", device="cpu")
+# -----------------------------
+# Load Model
+# -----------------------------
+device = "cpu"
 
-def get_route(coords):
-    coords = np.array(coords, dtype=np.float32)
-    coords = torch.tensor(coords).unsqueeze(0)
-    logits = model(coords)
-    order = torch.argsort(logits, dim=-1).squeeze(0).tolist()
+model = TransformerPointer()
+model.load_state_dict(torch.load("attn_pointer_rl.pt", map_location=device))
+model.eval()
+
+
+# -----------------------------
+# Utilities
+# -----------------------------
+def infer_best_order(coords):
+    """coords: numpy array (N,2)"""
+
+    coords_tensor = torch.tensor(coords, dtype=torch.float32).unsqueeze(0)
+
+    with torch.no_grad():
+        scores = model(coords_tensor)  # (1, N)
+        scores = scores.squeeze(0)
+
+    order = torch.argsort(scores, descending=False).tolist()
     return order
 
-@app.route("/optimize", methods=["POST"])
-def optimize():
-    data = request.json
-    coords = data["coords"]
-    order = get_route(coords)
-    return jsonify({"order": order})
 
+# -----------------------------
+# Root
+# -----------------------------
 @app.route("/")
 def home():
-    return "Route Optimizer API Ready!"
+    return "Hello! Route Optimizer AI is running."
 
+
+# -----------------------------
+# API: /optimize
+# -----------------------------
+@app.route("/optimize", methods=["POST"])
+def optimize():
+    data = request.get_json()
+    coords = np.array(data["coords"])
+
+    order = infer_best_order(coords)
+
+    return jsonify({
+        "order": order
+    })
+
+
+# -----------------------------
+# Run
+# -----------------------------
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=8000)
+    app.run(host="0.0.0.0", port=5000)
